@@ -126,7 +126,7 @@ class Client(object):
                             if invtype == 1:
                                 if invhash == txhash:
                                     print "OUR TRANSACTION IS IN THEIR MEMPOOL, TRANSACTION ACCEPTED! YAY!"
-                                    print "TX ID: ", txhash
+                                    print "TX ID: %s", % txhash
                             elif invtype == 2:
                                 blocks_to_get.append(invhash)
                                 print "New block observed", invhash[::-1].encode("hex")
