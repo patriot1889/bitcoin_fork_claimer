@@ -126,7 +126,7 @@ class Client(object):
                             if invtype == 1:
                                 if invhash == txhash:
                                     print "OUR TRANSACTION IS IN THEIR MEMPOOL, TRANSACTION ACCEPTED! YAY!"
-                                    print "TX ID: %s", % txhash
+                                    print "TX ID: ", txhash[::-1].encode("hex")
                             elif invtype == 2:
                                 blocks_to_get.append(invhash)
                                 print "New block observed", invhash[::-1].encode("hex")
@@ -371,7 +371,7 @@ print "YOU ARE ABOUT TO SEND"
 
 get_consent("I am sending coins on the %s network and I accept the risks" % coin.fullname)
 
-print "generated transaction", txhash[::-1].encode("hex")
+print "TX ID: ", txhash[::-1].encode("hex")
 print "\n\nConnecting to servers and pushing transaction\nPlease wait for a minute before stopping the script to see if it entered the server mempool.\n\n"
 
 client = Client(coin)
