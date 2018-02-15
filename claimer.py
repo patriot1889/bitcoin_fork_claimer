@@ -53,46 +53,64 @@ def recv_all(s, length):
     return ret
     
 class Client(object):
+    
+    _MAX_MEMPOOL_CHECKS = 5
+    _MAX_CONNECTION_RETRIES = 100
+    
     def __init__(self, coin):
         self.coin = coin
+        self._transaction_sent = False
+        self._transaction_accepted = None
+        self._mempool_check_count = 0
+        self._connection_retries = 0
         
     def send(self, cmd, msg):
-        magic = struct.pack("<L", coin.magic)
+        magic = struct.pack("<L", self.coin.magic)
         wrapper = magic + cmd.ljust(12, "\x00") + struct.pack("<L", len(msg)) + hashlib.sha256(hashlib.sha256(msg).digest()).digest()[0:4] + msg
         self.sc.sendall(wrapper)
-        print "sent", repr(cmd)
+        print "---> %s (%d bytes)" % (repr(cmd), len(msg))
         
     def recv_msg(self):
-        header = recv_all(self.sc, 24)
-        
+        def recv_all(length):
+            ret = ""
+            while len(ret) < length:
+                temp = self.sc.recv(length - len(ret))
+                if len(temp) == 0:
+                    raise socket.error("Connection reset!")
+                ret += temp
+            return ret
+
+        header = recv_all(24)
         if len(header) != 24:
-            print "INVALID HEADER LENGTH", repr(head)
-            exit()
+            raise Exception("INVALID HEADER LENGTH\n%s" % repr(header))
 
         cmd = header[4:16].rstrip("\x00")
         payloadlen = struct.unpack("<I", header[16:20])[0]
-        payload = recv_all(self.sc, payloadlen)
+        payload = recv_all(payloadlen)
         return cmd, payload
         
     def send_tx(self, txhash, tx):
-        serverindex = ord(os.urandom(1)) % len(coin.seeds)
+        serverindex = ord(os.urandom(1)) % len(self.coin.seeds)
+        txhash_hexfmt = txhash[::-1].encode("hex")
         while True:
             try:
-                address = (coin.seeds[serverindex], coin.port)
-                print "trying to connect to", address
-                self.sc = socket.create_connection(address)
-                print "connected to", address
-
+                address = (coin.seeds[serverindex], self.coin.port)
+                print "Connecting to", address, "...",
+                self.sc = socket.create_connection(address, 10)
+                print "SUCCESS!"
+                self.sc.settimeout(120)
+                
                 services = 0
                 localaddr = "\x00" * 8 + "00000000000000000000FFFF".decode("hex") + "\x00" * 6
                 nonce = os.urandom(8)
                 user_agent = "Scraper"
-                msg = struct.pack("<IQQ", coin.versionno, services, int(time.time())) + localaddr + localaddr + nonce + lengthprefixed(user_agent) + struct.pack("<IB", 0, 0)
+                msg = struct.pack("<IQQ", self.coin.versionno, services, int(time.time())) + (
+                    localaddr + localaddr + nonce + lengthprefixed(user_agent) + struct.pack("<IB", 0, 0))
                 client.send("version", msg)
 
                 while True:
                     cmd, payload = client.recv_msg()
-                    print "received", cmd, "size", len(payload)
+                    print "<--- '%s' (%d bytes)" % (cmd, len(payload))
                     if cmd == "version":
                         client.send("verack", "")
                         
@@ -102,60 +120,104 @@ class Client(object):
                         
                     elif cmd == "ping":
                         client.send("pong", payload)
-                        client.send("inv", "\x01" + struct.pack("<I", 1) + txhash)
+
+                        if not self._transaction_sent:
+                            client.send("inv", "\x01" + struct.pack("<I", 1) + txhash)
+                        elif not self._transaction_accepted:
+                            client.send("tx", tx)
+                            print "\tRe-sent transaction: %s" % txhash_hexfmt
+
                         client.send("mempool", "")
-                        #client.send("getaddr", "")
                         
                     elif cmd == "getdata":
                         if payload == "\x01\x01\x00\x00\x00" + txhash:
-                            print "sending txhash"
+                            print "\tPeer requesting transaction details for %s" % txhash_hexfmt
                             client.send("tx", tx)
+                            print "\tSENT TRANSACTION: %s" % txhash_hexfmt
+                            self._transaction_sent = True
+
+                        # If a getdata comes in without our txhash, it generally means the tx was rejected.
+                        elif self._transaction_sent:
+                            print "\tReceived getdata without our txhash. The transaction may have been rejected."
+                            print "\tThis script will retransmit the transaction and monitor the mempool for a few minutes before giving up."
                          
                     elif cmd == "feefilter":
                         minfee = struct.unpack("<Q", payload)[0]
-                        print "server requires minimum fee of %d satoshis" % minfee
+                        print "\tServer requires minimum fee of %d satoshis" % minfee
+                        print "\tYour fee may be too small."
                             
                     elif cmd == "inv":
                         blocks_to_get = []
                         st = cStringIO.StringIO(payload)
                         ninv = read_varint(st)
+                        transaction_found = False
+                        invtypes = {1: 'transaction', 2: 'block'}
                         for i in xrange(ninv):
                             invtype = struct.unpack("<I", st.read(4))[0]
                             invhash = st.read(32)
+                            invtypestr = invtypes[invtype] if invtype in invtypes else str(invtype)
+
+                            if i < 10:
+                                print "\t%s: %s" % (invtypestr, invhash[::-1].encode("hex"))
+                            elif i == 10:
+                                print "\t..."
+                                print "\tNot printing additional %d transactions" % (ninv - i)
                             
                             if invtype == 1:
                                 if invhash == txhash:
-                                    print "OUR TRANSACTION IS IN THEIR MEMPOOL, TRANSACTION ACCEPTED! YAY!"
-                                    print "TX ID: ", txhash[::-1].encode("hex")
+                                    transaction_found = True
                             elif invtype == 2:
                                 blocks_to_get.append(invhash)
-                                print "New block observed", invhash[::-1].encode("hex")
-                                
-                        if len(blocks_to_get) > 0:
+                        if transaction_found and not self._transaction_accepted:        
+                            print "\n\tOUR TRANSACTION IS IN THEIR MEMPOOL, TRANSACTION ACCEPTED! YAY!"
+							print "TX ID: ", txhash
+                            print "\tConsider leaving this script running until it detects the transaction in a block."
+                            self._transaction_accepted = True
+                        elif transaction_found:
+                            print "\tTransaction still in mempool. Continue waiting for block inclusion."
+                        elif not blocks_to_get:
+                            print "\n\tOur transaction was not found in the mempool."
+                            self._mempool_check_count += 1
+                            if self._mempool_check_count <= self._MAX_MEMPOOL_CHECKS:
+                                print "\tWill retransmit and check again %d more times." % (self._MAX_MEMPOOL_CHECKS - self._mempool_check_count)
+                            else:
+                                raise Exception("\tGiving up on transaction. Please verify that the inputs have not already been spent.")
+
+                        if blocks_to_get:
                             inv = ["\x02\x00\x00\x00" + invhash for invhash in blocks_to_get]
                             msg = make_varint(len(inv)) + "".join(inv)
                             client.send("getdata", msg)
+                            print "\trequesting %d blocks" % len(blocks_to_get)
                         
                     elif cmd == "block":
                         if tx in payload or plaintx in payload:
-                            print "BLOCK WITH OUR TRANSACTION OBSERVED! YES!"
+                            print "\tBLOCK WITH OUR TRANSACTION OBSERVED! YES!"
+                            print "\tYour coins have been successfully sent. Exiting..."
+                            return
+                        else:
+                            print "\tTransaction not included in observed block."
                             
                     elif cmd == "addr":
                         st = cStringIO.StringIO(payload)
                         naddr = read_varint(st)
-                        for i in xrange(naddr):
+                        for _ in xrange(naddr):
                             data = st.read(30)
                             if data[12:24] == "\x00" * 10 + "\xff\xff":
-                                print "got peer ipv4 address %d.%d.%d.%d port %d" % struct.unpack(">BBBBH", data[24:30])
+                                address = "%d.%d.%d.%d:%d" % struct.unpack(">BBBBH", data[24:30])
                             else:
-                                print "got peer ipv6 address %04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x port %d" % struct.unpack(">HHHHHHHHH", data[12:30])
-                        
-                    else:
+                                address = "[%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x]:%d" % struct.unpack(">HHHHHHHHH", data[12:30])
+                            print "\tGot peer address: %s" % address
+                    elif cmd not in ('sendcmpct', 'verack'):
                         print repr(cmd), repr(payload)
                 
             except (socket.error, socket.herror, socket.gaierror, socket.timeout) as e:
-                traceback.print_exc()
-                serverindex = (serverindex + 1) % len(coin.seeds)
+                if self._connection_retries >= self._MAX_CONNECTION_RETRIES:
+                    raise
+                print "\tConnection failed with: %s" % repr(e)
+                print "\tWill retry %d more times." % (self._MAX_CONNECTION_RETRIES - self._connection_retries)
+                serverindex = (serverindex + 1) % len(self.coin.seeds)
+                self._connection_retries += 1
+                time.sleep(2)
 
     
 class BitcoinFork(object):
@@ -165,6 +227,11 @@ class BitcoinFork(object):
         self.extrabytes = ""
         self.BCDgarbage = ""
         self.txversion = 1
+        self.signtype = 0x01
+        self.signid = self.signtype
+        self.PUBKEY_ADDRESS = chr(0)
+        self.SCRIPT_ADDRESS = chr(5)
+        self.bch_fork = False
         
 class BitcoinFaith(BitcoinFork):
     def __init__(self):
@@ -235,8 +302,6 @@ class Bitcoin2X(BitcoinFork):
         self.seeds = ("node1.b2x-segwit.io", "node2.b2x-segwit.io", "node3.b2x-segwit.io", "136.243.147.159", "136.243.171.156", "46.229.165.141", "178.32.3.12")
         self.signtype = 0x21
         self.signid = self.signtype
-        self.PUBKEY_ADDRESS = chr(0)
-        self.SCRIPT_ADDRESS = chr(5)
         self.versionno = 70015 | (1 << 27)
 
 class UnitedBitcoin(BitcoinFork):
@@ -250,8 +315,6 @@ class UnitedBitcoin(BitcoinFork):
         self.seeds = ("urlelcm1.ub.com", "urlelcm2.ub.com", "urlelcm3.ub.com", "urlelcm4.ub.com", "urlelcm5.ub.com", "urlelcm6.ub.com", "urlelcm7.ub.com", "urlelcm8.ub.com", "urlelcm9.ub.com", "urlelcm10.ub.com")
         self.signtype = 0x09
         self.signid = self.signtype
-        self.PUBKEY_ADDRESS = chr(0)
-        self.SCRIPT_ADDRESS = chr(5)
         self.versionno = 731800
         self.extrabytes = "\x02ub"
 
@@ -266,8 +329,6 @@ class SuperBitcoin(BitcoinFork):
         self.seeds = ("seed.superbtca.com", "seed.superbtca.info", "seed.superbtc.org")
         self.signtype = 0x41
         self.signid = self.signtype
-        self.PUBKEY_ADDRESS = chr(0)
-        self.SCRIPT_ADDRESS = chr(5)
         self.extrabytes = lengthprefixed("sbtc")
         
 class BitcoinDiamond(BitcoinFork):
@@ -281,8 +342,6 @@ class BitcoinDiamond(BitcoinFork):
         self.seeds = ("seed1.dns.btcd.io", "seed2.dns.btcd.io", "seed3.dns.btcd.io", "seed4.dns.btcd.io", "seed5.dns.btcd.io", "seed6.dns.btcd.io")
         self.signtype = 0x01
         self.signid = self.signtype
-        self.PUBKEY_ADDRESS = chr(0)
-        self.SCRIPT_ADDRESS = chr(5)
         self.txversion = 12
         self.BCDgarbage = "\xff" * 32
         self.coinratio = 10.0
@@ -312,8 +371,6 @@ class BitcoinNew(BitcoinFork):
         self.seeds = ("dnsseed.bitcoin-new.org",)
         self.signtype = 0x41
         self.signid = self.signtype | (88 << 8)
-        self.PUBKEY_ADDRESS = chr(0)
-        self.SCRIPT_ADDRESS = chr(5)
 
 class BitcoinHot(BitcoinFork):
     def __init__(self):
@@ -331,34 +388,177 @@ class BitcoinHot(BitcoinFork):
         self.versionno = 70016
         self.coinratio = 100.0
 
+# https://github.com/bitcoinvote/bitcoin
+class BitcoinVote(BitcoinFork):
+    def __init__(self):
+        BitcoinFork.__init__(self)
+        self.ticker = "BTV"
+        self.fullname = "Bitcoin Vote"
+        self.hardforkheight = 505050
+        self.magic = 0x505050f9
+        self.port = 8333
+        self.seeds = ("seed1.bitvote.one", "seed2.bitvote.one", "seed3.bitvote.one")
+        self.signtype = 0x41
+        self.signid = self.signtype | (50 << 8)
+
+class BitcoinTop(BitcoinFork):
+    def __init__(self):
+        BitcoinFork.__init__(self)
+        self.ticker = "BTT"
+        self.fullname = "Bitcoin Top"
+        self.hardforkheight = 501118
+        self.magic = 0xd0b4bef9
+        self.port = 18888
+        self.seeds = ("dnsseed.bitcointop.org", "seed.bitcointop.org", "worldseed.bitcointop.org", "dnsseed.bitcointop.group", "seed.bitcointop.group",
+            "worldseed.bitcointop.group", "dnsseed.bitcointop.club", "seed.bitcointop.club", "worldseed.bitcointop.club")
+        self.signtype = 0x01
+        self.signid = self.signtype
+        self.txversion = 13
+        self.BCDgarbage = "\xff" * 32
+
+class BitCore(BitcoinFork):
+    def __init__(self):
+        BitcoinFork.__init__(self)
+        self.ticker = "BTX"
+        self.fullname = "BitCore"
+        self.hardforkheight = 492820
+        self.magic = 0xd9b4bef9
+        self.port = 8555
+        self.seeds = ("37.120.190.76", "37.120.186.85", "185.194.140.60", "188.71.223.206", "185.194.142.122")
+        self.signtype = 0x01
+        self.signid = self.signtype
+        
+class BitcoinPay(BitcoinFork):
+    def __init__(self):
+        BitcoinFork.__init__(self)
+        self.ticker = "BTP"
+        self.fullname = "Bitcoin Pay"
+        self.hardforkheight = 499345
+        self.signtype = 0x41
+        self.signid = self.signtype | (80 << 8)
+        self.PUBKEY_ADDRESS = chr(0x38)
+        self.SCRIPT_ADDRESS = chr(5) # NOT CERTAIN
+        self.coinratio = 10.0
+
+# https://github.com/btcking/btcking
+class BitcoinKing(BitcoinFork):
+    def __init__(self):
+        BitcoinFork.__init__(self)
+        self.ticker = "BCK"
+        self.fullname = "Bitcoin King"
+        self.hardforkheight = 499999
+        self.magic = 0x161632af
+        self.port = 16333
+        self.seeds = ("47.52.28.49",)
+        self.signtype = 0x41
+        self.signid = self.signtype | (143 << 8)
+        
+# https://github.com/bitcoincandyofficial/bitcoincandy
+class BitcoinCandy(BitcoinFork):
+    def __init__(self):
+        BitcoinFork.__init__(self)
+        self.ticker = "CDY"
+        self.fullname = "Bitcoin Candy"
+        self.hardforkheight = 512666
+        self.magic = 0xd9c4c3e3
+        self.port = 8367
+        self.seeds = ("seed.bitcoincandy.one", "seed.cdy.one")
+        self.signtype = 0x41
+        self.signid = self.signtype | (111 << 8)
+        self.PUBKEY_ADDRESS = chr(0x1c)
+        self.SCRIPT_ADDRESS = chr(0x58)
+        self.coinratio = 1000.0
+
+# https://github.com/BTSQ/BitcoinCommunity
+class BitcoinCommunity(BitcoinFork):
+    def __init__(self):
+        BitcoinFork.__init__(self)
+        self.ticker = "BTSQ"
+        self.fullname = "Bitcoin Community"
+        self.hardforkheight = 506066
+        self.magic = 0xd9c4ceb9
+        self.port = 8866
+        self.seeds = ("dnsseed.aliyinke.com", "seed1.aliyinke.com", "seed2.aliyinke.com", "seed3.aliyinke.com")
+        self.signtype = 0x11
+        self.signid = self.signtype | (31 << 8)
+        self.PUBKEY_ADDRESS = chr(63)
+        self.SCRIPT_ADDRESS = chr(58)
+        self.coinratio = 1000.0
+
+# https://github.com/worldbitcoin/worldbitcoin
+class WorldBitcoin(BitcoinFork):
+    def __init__(self):
+        BitcoinFork.__init__(self)
+        self.ticker = "WBTC"
+        self.fullname = "World Bitcoin"
+        self.hardforkheight = 503888
+        self.magic = 0xd9b4bef9
+        self.port = 8338
+        self.seeds = ("dnsseed.btcteams.net", "dnsseed.wbtcteam.org")
+        self.signtype = 0x41
+        self.signid = self.signtype
+        self.extrabytes = lengthprefixed("wbtc")
+        self.coinratio = 100.0
+        
+# https://github.com/Bitcoin-ABC/bitcoin-abc
+class BitcoinCash(BitcoinFork):
+    def __init__(self):
+        BitcoinFork.__init__(self)
+        self.ticker = "BCH"
+        self.fullname = "Bitcoin Cash"
+        self.hardforkheight = 478559
+        self.magic = 0xe8f3e1e3
+        self.port = 8333
+        self.seeds = ("seed.bitcoinabc.org", "seed-abc.bitcoinforks.org", "seed.bitprim.org", "seed.deadalnix.me", "seeder.criptolayer.net")
+        self.signtype = 0x41
+        self.signid = self.signtype
+
 parser = argparse.ArgumentParser()
-parser.add_argument("cointicker", help="Coin type", choices=["BTF", "BTW", "BTG", "BCX", "B2X", "UBTC", "SBTC", "BCD", "BPA", "BTN", "BTH"])
+parser.add_argument("cointicker", help="Coin type", choices=["BTF", "BTW", "BTG", "BCX", "B2X", "UBTC", "SBTC", "BCD", "BPA", "BTN", "BTH", "BTV", "BTT", "BTX", "BTP", "BCK", "CDY", "BTSQ", "WBTC", "BCH"])
 parser.add_argument("txhex", help="Raw transaction to broadcast")
 
 args = parser.parse_args()
 
-if args.cointicker == "BTF":
-    coin = BitcoinFaith()
-if args.cointicker == "BTW":
-    coin = BitcoinWorld()
-if args.cointicker == "BTG":
-    coin = BitcoinGold()
-if args.cointicker == "BCX":
-    coin = BitcoinX()
 if args.cointicker == "B2X":
     coin = Bitcoin2X()
-if args.cointicker == "UBTC":
-    coin = UnitedBitcoin()
-if args.cointicker == "SBTC":
-    coin = SuperBitcoin()
-if args.cointicker == "BCD":
+elif args.cointicker == "BCD":
     coin = BitcoinDiamond()
-if args.cointicker == "BPA":
+elif args.cointicker == "BCH":
+    coin = BitcoinCash()
+elif args.cointicker == "BCK":
+    coin = BitcoinKing()
+elif args.cointicker == "BCX":
+    coin = BitcoinX()
+elif args.cointicker == "BPA":
     coin = BitcoinPizza()
-if args.cointicker == "BTN":
-    coin = BitcoinNew()
-if args.cointicker == "BTH":
+elif args.cointicker == "BTF":
+    coin = BitcoinFaith()
+elif args.cointicker == "BTG":
+    coin = BitcoinGold()
+elif args.cointicker == "BTH":
     coin = BitcoinHot()
+elif args.cointicker == "BTN":
+    coin = BitcoinNew()
+elif args.cointicker == "BTP":
+    coin = BitcoinPay()
+elif args.cointicker == "BTSQ":
+    coin = BitcoinCommunity()
+elif args.cointicker == "BTT":
+    coin = BitcoinTop()
+elif args.cointicker == "BTV":
+    coin = BitcoinVote()
+elif args.cointicker == "BTW":
+    coin = BitcoinWorld()
+elif args.cointicker == "BTX":
+    coin = BitCore()
+elif args.cointicker == "CDY":
+    coin = BitcoinCandy()
+elif args.cointicker == "SBTC":
+    coin = SuperBitcoin()
+elif args.cointicker == "UBTC":
+    coin = UnitedBitcoin()
+elif args.cointicker == "WBTC":
+    coin = WorldBitcoin()
 
 tx = args.txhex.decode("hex")
 txhash = doublesha(tx)
@@ -369,7 +569,7 @@ print
 
 print "YOU ARE ABOUT TO SEND"
 
-get_consent("I am sending coins on the %s network and I accept the risks" % coin.fullname)
+get_consent("send it")
 
 print "TX ID: ", txhash[::-1].encode("hex")
 print "\n\nConnecting to servers and pushing transaction\nPlease wait for a minute before stopping the script to see if it entered the server mempool.\n\n"
