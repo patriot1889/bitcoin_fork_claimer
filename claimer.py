@@ -170,7 +170,7 @@ class Client(object):
                                 blocks_to_get.append(invhash)
                         if transaction_found and not self._transaction_accepted:        
                             print "\n\tOUR TRANSACTION IS IN THEIR MEMPOOL, TRANSACTION ACCEPTED! YAY!"
-							print "TX ID: ", txhash
+                            print "TX ID: ", txhash
                             print "\tConsider leaving this script running until it detects the transaction in a block."
                             self._transaction_accepted = True
                         elif transaction_found:
