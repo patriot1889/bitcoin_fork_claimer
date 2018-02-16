@@ -170,7 +170,7 @@ class Client(object):
                                 blocks_to_get.append(invhash)
                         if transaction_found and not self._transaction_accepted:        
                             print "\n\tOUR TRANSACTION IS IN THEIR MEMPOOL, TRANSACTION ACCEPTED! YAY!"
-                            print "TX ID: ", txhash
+                            print "\tTX ID: ", txhash[::-1].encode("hex")
                             print "\tConsider leaving this script running until it detects the transaction in a block."
                             self._transaction_accepted = True
                         elif transaction_found:
@@ -563,8 +563,6 @@ elif args.cointicker == "WBTC":
 tx = args.txhex.decode("hex")
 txhash = doublesha(tx)
 
-print "Raw transaction"
-print tx.encode("hex")
 print
 
 print "YOU ARE ABOUT TO SEND"
