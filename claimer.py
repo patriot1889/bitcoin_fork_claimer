@@ -190,7 +190,7 @@ class Client(object):
                             print "\trequesting %d blocks" % len(blocks_to_get)
                         
                     elif cmd == "block":
-                        if tx in payload or plaintx in payload:
+                        if tx in payload or txhash in payload:
                             print "\tBLOCK WITH OUR TRANSACTION OBSERVED! YES!"
                             print "\tYour coins have been successfully sent. Exiting..."
                             return
