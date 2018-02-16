@@ -28,6 +28,6 @@ The following coins are recognized, although may not be fully tested:
 *  UBTC - [United Bitcoin](https://www.ub.com/)
 *  WBTC - [World Bitcoin](http://www.wbtcteam.org/)
 
-USAGE OF THIS SCRIPT IS RISKY AND IF YOU MISTYPE ANYTHING YOU CAN LOSE ALL YOUR COINS
+Usage of this script is not risky. However, creating raw transactions can be. Please make sure you are using the correct send addresses and fees.
 
     claimer.py <cointype> <signedtxhex>
